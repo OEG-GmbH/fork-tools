@@ -1,0 +1,62 @@
+name: upstream-sync
+
+# Reusable workflow: pulls an upstream branch into the calling fork behind guardrails.
+# Clean merge -> fast-forward push to the branch. Anything suspicious -> pull request.
+# See README.md for the guardrails and their limits.
+on:
+  workflow_call:
+    inputs:
+      upstream:
+        description: owner/repo of the upstream repository
+        type: string
+        required: true
+      branch:
+        description: branch name, the same on upstream and fork
+        type: string
+        default: main
+      plugin_paths:
+        description: newline-separated paths scanned for capability changes
+        type: string
+        default: .
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync-run-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # The scripts come from the same commit of this repository that the caller pinned.
+      - name: Fetch the sync scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: tools
+          persist-credentials: false
+
+      - name: Check out the fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.branch }}
+          path: repo
+          fetch-depth: 0
+
+      - name: Sync
+        working-directory: repo
+        env:
+          UPSTREAM: ${{ inputs.upstream }}
+          BRANCH: ${{ inputs.branch }}
+          PLUGIN_PATHS: ${{ inputs.plugin_paths }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          bash ../tools/sync.sh
