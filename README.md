@@ -15,6 +15,28 @@ A reusable workflow (`.github/workflows/upstream-sync.yml`) fetches the upstream
 - All clean: fast-forward push to the branch, sync branch removed. Never a force push on the branch.
 - Anything found: the branch is pushed and a pull request `sync: upstream <sha12> needs review` lists the findings.
 
+### Versions
+
+Claude Code updates an installed plugin only when `version` in its manifest changes, so a sync that
+takes upstream content also sets a new version (`version-bump.sh`, run on the merged tree for every
+plugin root under `plugin_paths`, including nested `.claude-plugin/plugin.json` roots). Only roots
+whose content the merge actually changed are touched.
+
+| Situation | New version |
+|---|---|
+| upstream raised its version, fork has `tools/fork-guard.sh` (patch applies) | `<upstream>-fork.1` |
+| upstream raised its version, fork without a guard | `<upstream>` |
+| upstream changed content, same version | `<upstream>-fork.<n+1>` (n = suffix of the fork's current version, 0 if none) |
+
+All version-bearing manifests of the root (`plugin.json`, `.codex-plugin/`, `.factory-plugin/`,
+`.qoder-plugin/`, `kimi.plugin.json`) and the matching `plugins[]` entry of each `marketplace.json`
+(by `source`, only if it carries a version) get the same value.
+
+Merge conflicts in `plugin.json`, `*.plugin.json` and `marketplace.json` whose hunks consist only of
+`"version"` lines are resolved automatically (`resolve-version-conflicts.sh`); the version is then set
+by the rule above. Any other conflict (a hunk with another line, any other file) goes to a pull request
+with the conflict markers committed.
+
 Changes to `.github/workflows/` are never pushed (the workflow token is not allowed to); they are
 reverted on the sync branch and listed in the pull request.
 
@@ -63,6 +85,7 @@ This is a tripwire for the obvious, not a review.
 - Pattern matching sees text, not behaviour: obfuscated or assembled strings (`"fe" + "tch"`), `import()` of remote code, or a changed argument to an existing call are not caught. `exec(` also matches `RegExp.exec(`; false positives only cost a pull request.
 - Only added lines are inspected, only inside `plugin_paths`, and not in Markdown. Prose that instructs a model (skill and command bodies) is not analysed.
 - Changed lockfiles and vendored dependencies are not read.
+- Versions follow the rule above; a version that was set by hand in the fork is overwritten on the next sync that changes the plugin.
 - The fork's own guard decides whether fork patches survive; this tool does not know them.
 
 ## Tests

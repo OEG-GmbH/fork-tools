@@ -69,14 +69,53 @@ note() { printf '%s\n' "$*" >>"$findings"; }
 
 git checkout -q -B "$sb" "$base"
 msg="chore(sync): merge upstream $short"
+info=$workdir/info.md
+: >"$info"
 if ! git merge --no-edit -m "$msg" "$up" >"$workdir/merge.log" 2>&1; then
   conflicts=$(git diff --name-only --diff-filter=U)
   [ -n "$conflicts" ] || { cat "$workdir/merge.log" >&2; die "merge failed without conflicts"; }
-  note "- **Merge conflict.** The branch carries the conflict markers as committed text; resolve them before merging. Files:"
-  while IFS= read -r c; do note "  - \`$c\`"; done <<<"$conflicts"
-  git add -A
-  git commit -q -m "$msg (conflict markers committed, do not merge as is)"
+  # Conflicts that only concern version lines of a manifest are resolved here (the final
+  # version is set below); everything else is for a person.
+  remaining=()
+  while IFS= read -r c; do
+    if bash "$here/resolve-version-conflicts.sh" "$c"; then
+      git add -- "$c"
+      printf '%s\n' "- Version-only conflict resolved automatically: \`$c\`" >>"$info"
+    else
+      remaining+=("$c")
+    fi
+  done <<<"$conflicts"
+  if [ ${#remaining[@]} -eq 0 ]; then
+    git commit -q --no-edit
+  else
+    note "- **Merge conflict.** The branch carries the conflict markers as committed text; resolve them before merging. Files:"
+    for c in "${remaining[@]}"; do note "  - \`$c\`"; done
+    git add -A
+    git commit -q -m "$msg (conflict markers committed, do not merge as is)"
+  fi
 fi
+
+# A plugin only updates for its users when its version changes: set it from what was taken.
+if git cat-file -e "$base:tools/fork-guard.sh" 2>/dev/null; then patched=1; else patched=0; fi
+set +e
+vout=$(FORK_PATCHED=$patched bash "$here/version-bump.sh" "$base" "$up" "${paths[@]}")
+vrc=$?
+set -e
+printf '%s\n' "$vout"
+case $vrc in
+  0) ;;
+  3) note "- **Version not set** for some plugin (manifest is not valid JSON, probably conflict markers):"
+     note ""
+     note "$(printf '%s\n' "$vout" | grep '^SKIP' | sed 's/^/  - /')" ;;
+  *) die "version-bump failed (exit $vrc)" ;;
+esac
+if ! git diff --quiet; then
+  git add -A
+  git commit -q -m "chore(sync): set plugin version after upstream $short"
+  printf '%s\n' "$vout" | grep -E '^(ROOT|MARKETPLACE)' | sed 's/^/- Version: /' >>"$info"
+fi
+
+[ ! -s "$info" ] || cat "$info"
 
 # GITHUB_TOKEN may not create or change workflow files; keep the fork's own.
 wf=$(git diff --name-only "$base" HEAD -- .github/workflows)
@@ -130,6 +169,7 @@ if [ ! -s "$findings" ]; then
   git checkout -q "$branch" 2>/dev/null || true
   git branch -q -D "$sb" 2>/dev/null || true
   summary "Merged upstream \`$short\` into \`$branch\` (guardrails clean)."
+  [ ! -s "$info" ] || summary "$(cat "$info")"
   decide push
   exit 0
 fi
@@ -159,6 +199,12 @@ git push --force-with-lease origin "+refs/heads/$sb:refs/heads/$sb"
   echo
   cat "$findings"
   echo
+  if [ -s "$info" ]; then
+    echo "## Done automatically"
+    echo
+    cat "$info"
+    echo
+  fi
   echo "## New upstream commits"
   echo
   echo '````'
