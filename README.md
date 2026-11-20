@@ -1,71 +1,42 @@
 # fork-tools
 
-Keeps forks of third-party plugin repositories on the newest upstream state, and keeps risky
-upstream changes out of the fork's default branch until a person has looked at them.
+Proposes the newest upstream state of a fork as a pull request, with the risky parts of the change
+listed in the pull request text. **It never merges and never pushes to the fork's base branch**:
+the only ref it writes is `upstream-sync/<date>`, and a person merges the pull request.
 
 ## How it works
 
-A reusable workflow (`.github/workflows/upstream-sync.yml`) fetches the upstream branch.
+A reusable workflow (`.github/workflows/upstream-sync.yml`) is called from a small workflow in each
+fork (schedule daily, plus `workflow_dispatch`). `sync.sh` does the work:
 
-- Nothing new compared with the fork: the run ends green.
-- Otherwise the upstream commit is merged into `sync/<sha12>` and checked:
-  1. the fork's own `tools/fork-guard.sh`, if present (taken from the pre-merge tree, run against the merged tree),
-  2. `capability-diff.sh` for every path in `plugin_paths`,
-  3. merge conflicts.
-- All clean: fast-forward push to the branch, sync branch removed. Never a force push on the branch.
-- Anything found: the branch is pushed and a pull request `sync: upstream <sha12> needs review` lists the findings.
+1. Fetch the upstream default branch. Nothing new compared with the base branch: the run ends green.
+2. Otherwise merge it into `upstream-sync/<date>` (a conflict is committed as markers and listed).
+3. Open a pull request against the base branch. If a sync pull request is already open, its branch
+   is rebuilt from the current base and the newest upstream and its text is replaced (nothing changes
+   if it already carries both). A branch with commits by a person is left alone.
+4. Push only through `push_sync_branch`, which refuses every ref outside `upstream-sync/*`.
 
-### Versions
+The pull request text lists the upstream commits, the changed files, the guardrail findings and the
+result of the fork's `tools/fork-guard.sh` on the merged tree (taken from the pre-merge tree, so a
+merge cannot swap the checker). Changes to `.github/workflows/` are left out of the branch (the
+workflow token may not push them) and listed.
 
-Claude Code updates an installed plugin only when `version` in its manifest changes, so a sync that
-takes upstream content also sets a new version (`version-bump.sh`, run on the merged tree for every
-plugin root under `plugin_paths`, including nested `.claude-plugin/plugin.json` roots). Only roots
-whose content the merge actually changed are touched.
+## Guardrails (all of them only report)
 
-| Situation | New version |
-|---|---|
-| upstream raised its version, fork has `tools/fork-guard.sh` (patch applies) | `<upstream>-fork.1` |
-| upstream raised its version, fork without a guard | `<upstream>` |
-| upstream changed content, same version | `<upstream>-fork.<n+1>` (n = suffix of the fork's current version, 0 if none) |
+| Check | Script | Reports |
+|---|---|---|
+| hook texts | `hook-text-diff.sh` | files of the fork's list `tools/hook-text-paths.txt` that differ (title gets `[hook texts changed]`) |
+| capabilities and patterns | `capability-diff.sh` | see below |
+| fork patches | the fork's `tools/fork-guard.sh` | pass/fail on the merged tree (title gets `[fork-guard failed]`) |
+| conflicts | `version-conflict.sh` | conflicted files; manifests whose conflict is only `version` lines are labelled |
 
-All version-bearing manifests of the root (`plugin.json`, `.codex-plugin/`, `.factory-plugin/`,
-`.qoder-plugin/`, `kimi.plugin.json`) and the matching `plugins[]` entry of each `marketplace.json`
-(by `source`, only if it carries a version) get the same value.
+`tools/hook-text-paths.txt` lives in the fork and is versioned with it: one git glob per line
+(`hooks/**`, `**/hooks.json`), `#` starts a comment. The list is read from the tree before the merge,
+so an upstream change cannot shorten it. A fork without the file gets a note in the pull request.
 
-Merge conflicts in `plugin.json`, `*.plugin.json` and `marketplace.json` whose hunks consist only of
-`"version"` lines are resolved automatically (`resolve-version-conflicts.sh`); the version is then set
-by the rule above. Any other conflict (a hunk with another line, any other file) goes to a pull request
-with the conflict markers committed.
+### `capability-diff.sh`
 
-Changes to `.github/workflows/` are never pushed (the workflow token is not allowed to); they are
-reverted on the sync branch and listed in the pull request.
-
-## Caller
-
-```yaml
-name: upstream-sync
-on:
-  schedule:
-    - cron: '17 4 * * *'
-  workflow_dispatch:
-permissions: {}
-jobs:
-  sync:
-    permissions:
-      contents: write
-      pull-requests: write
-    uses: <owner>/fork-tools/.github/workflows/upstream-sync.yml@<full commit sha>
-    with:
-      upstream: owner/repo
-      plugin_paths: |
-        plugins/example
-```
-
-The fork needs "Allow GitHub Actions to create and approve pull requests" for the pull request path.
-
-## What `capability-diff.sh` reports
-
-Per plugin path, comparing the fork's branch with the merge result:
+Per plugin path, comparing the base branch with the merge result:
 
 - added or changed `hooks/hooks.json`, `.mcp.json`; `hooks`, `mcpServers`, `lspServers`, `commands`, `agents`, `outputStyles` changed inside `plugin.json` / `marketplace.json`
 - new files below `hooks/`, `commands/`, `agents/`
@@ -76,18 +47,50 @@ Per plugin path, comparing the fork's branch with the merge result:
   `fetch(`, `http://`, `https://`, `curl`, `wget`, `child_process`, `spawn(`, `spawnSync(`, `exec(`, `execSync(`, `execFile(`, `eval(`, `new Function`, `npx`, `pip install`, `base64 -d`, `Bun.spawn`, `Bun.$`, `Deno.run`, `Deno.Command`, `subprocess`, `os.system`
 - anywhere in the repository: changes to `tools/fork-guard.sh` and `.github/workflows/`
 
-Exit 0 clean, 1 findings, 2 error (an unreadable ref or unknown path fails the job, nothing is pushed).
+## Caller
+
+```yaml
+name: upstream-sync
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Branch the pull request targets (default main)
+        default: main
+permissions: {}
+jobs:
+  sync:
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: <owner>/fork-tools/.github/workflows/upstream-sync.yml@<full commit sha>
+    with:
+      upstream: owner/repo
+      base: ${{ inputs.base || 'main' }}
+      plugin_paths: |
+        plugins/example
+```
+
+The fork needs "Allow GitHub Actions to create and approve pull requests". The token needs
+`contents: write` to push the sync branch; GitHub cannot scope that to one branch, so the guarantee
+that `main` stays untouched is `push_sync_branch` plus the tests, not the token.
+
+To try the workflow against an artificially old state, push a branch whose content is older than
+upstream and dispatch with `base` set to it: the pull request targets that branch.
 
 ## Limits
 
 This is a tripwire for the obvious, not a review.
 
-- Pattern matching sees text, not behaviour: obfuscated or assembled strings (`"fe" + "tch"`), `import()` of remote code, or a changed argument to an existing call are not caught. `exec(` also matches `RegExp.exec(`; false positives only cost a pull request.
-- Only added lines are inspected, only inside `plugin_paths`, and not in Markdown. Prose that instructs a model (skill and command bodies) is not analysed.
+- Pattern matching sees text, not behaviour: obfuscated or assembled strings (`"fe" + "tch"`), `import()` of remote code, or a changed argument to an existing call are not caught. `exec(` also matches `RegExp.exec(`; false positives only cost reading time.
+- Only added lines are inspected, only inside `plugin_paths`, and not in Markdown. Prose that instructs a model is only flagged when it sits in the hook-text list.
 - Changed lockfiles and vendored dependencies are not read.
-- Versions follow the rule above; a version that was set by hand in the fork is overwritten on the next sync that changes the plugin.
-- The fork's own guard decides whether fork patches survive; this tool does not know them.
+- The PR text is cut at fixed sizes (findings 20000 characters, commits 100, files 300).
+- A closed sync pull request is not reopened; the next run with new upstream commits opens a new one.
 
 ## Tests
 
-`bash tests/test.sh` builds throw-away repositories and holds every guardrail against a failing and a passing case.
+`bash tests/test.sh` builds throw-away repositories (and a stub `gh`) and holds every guardrail
+against a failing and a passing case; each sync case also checks that the origin's `main` did not move.

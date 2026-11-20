@@ -91,170 +91,209 @@ cd_repo; mkdir tools; echo 'true' >tools/fork-guard.sh; check "cd: fork-guard ch
 cd_repo; check "cd: unknown plugin path is an error (2)" 2 "$(git commit -q --allow-empty -m e; bash "$root/capability-diff.sh" HEAD~1 HEAD nope >/dev/null 2>&1; echo $?)"
 cd_repo; check "cd: bad ref is an error (2)" 2 "$(bash "$root/capability-diff.sh" nope HEAD plug >/dev/null 2>&1; echo $?)"
 
-# ---------------------------------------------------------------- sync.sh
-# fresh upstream + fork; the fork carries a patch marker and a guard
+
+# ---------------------------------------------------------------- hook-text-diff.sh
+ht_repo() {
+  rm -rf "$T/ht"; mkdir -p "$T/ht/tools" "$T/ht/hooks" "$T/ht/skills" "$T/ht/x/hooks"; cd "$T/ht" || exit 1
+  git init -q -b main
+  printf '# hook texts\nhooks/**\n**/hooks/**\n**/hooks.json   # any depth\n' >tools/hook-text-paths.txt
+  echo a >hooks/a.ts; echo d >skills/doc.md; echo h >x/hooks/h.ts; echo '{}' >x/hooks.json
+  git add -A; git commit -qm base
+}
+ht_run() { git add -A; git commit -qm change; bash "$root/hook-text-diff.sh" HEAD~1 HEAD tools/hook-text-paths.txt >"$T/ht.out" 2>"$T/ht.err"; echo $?; }
+ht_repo; echo more >>skills/doc.md; check "ht: change in a doc outside the list -> 0" 0 "$(ht_run)"
+ht_repo; echo more >>hooks/a.ts; check "ht: change in a listed file -> 1" 1 "$(ht_run)"
+check "ht: ... the file is named" yes "$(grep -q 'hooks/a.ts' "$T/ht.out" && echo yes || echo no)"
+ht_repo; echo more >>x/hooks/h.ts; check "ht: ** matches nested hooks/ -> 1" 1 "$(ht_run)"
+ht_repo; echo more >>x/hooks.json; check "ht: **/hooks.json matches at depth -> 1" 1 "$(ht_run)"
+ht_repo; echo new >hooks/new.ts; check "ht: added file in a listed dir -> 1" 1 "$(ht_run)"
+ht_repo; git rm -q hooks/a.ts; check "ht: deleted listed file -> 1" 1 "$(ht_run)"
+ht_repo; sed -i '/^hooks/d' tools/hook-text-paths.txt; echo more >>hooks/a.ts
+check "ht: the list is read from the base tree (upstream cannot shorten it) -> 1" 1 "$(ht_run)"
+ht_repo; git rm -q tools/hook-text-paths.txt; git commit -qm nolist; echo more >>hooks/a.ts; git add -A; git commit -qm c2
+check "ht: no list at the base -> 3" 3 "$(bash "$root/hook-text-diff.sh" HEAD~1 HEAD tools/hook-text-paths.txt >/dev/null 2>&1; echo $?)"
+ht_repo; printf '# nothing\n' >tools/hook-text-paths.txt; git add -A; git commit -qm empty; echo more >>hooks/a.ts; git add -A; git commit -qm c3
+check "ht: an empty list is an error (2)" 2 "$(bash "$root/hook-text-diff.sh" HEAD~1 HEAD tools/hook-text-paths.txt >/dev/null 2>&1; echo $?)"
+
+# ---------------------------------------------------------------- version-conflict.sh
+vc() { printf '%s' "$1" >"$T/plugin.json"; cp "$T/plugin.json" "$T/plugin.orig"; bash "$root/version-conflict.sh" "$T/plugin.json" >/dev/null 2>&1; echo $?; }
+VONLY=$'{\n<<<<<<< HEAD\n  "version": "1.0.0-fork.1",\n=======\n  "version": "1.1.0",\n>>>>>>> up\n  "name": "p"\n}\n'
+MIXED=$'{\n<<<<<<< HEAD\n  "version": "1.0.0-fork.1",\n  "description": "d"\n=======\n  "version": "1.1.0",\n  "description": "d2"\n>>>>>>> up\n  "name": "p"\n}\n'
+TWO=$'{\n<<<<<<< HEAD\n  "version": "1",\n=======\n  "version": "2",\n>>>>>>> up\n  "x": 1,\n<<<<<<< HEAD\n  "a": 1\n=======\n  "a": 2\n>>>>>>> up\n}\n'
+check "vc: version-only hunk -> 0" 0 "$(vc "$VONLY")"
+check "vc: ... file untouched (read-only)" yes "$(cmp -s "$T/plugin.json" "$T/plugin.orig" && echo yes || echo no)"
+check "vc: hunk with another line -> 1" 1 "$(vc "$MIXED")"
+check "vc: one version hunk + one other hunk -> 1" 1 "$(vc "$TWO")"
+printf 'no markers\n' >"$T/plugin.json"; check "vc: no markers -> 1" 1 "$(bash "$root/version-conflict.sh" "$T/plugin.json" >/dev/null 2>&1; echo $?)"
+printf '<<<<<<< a\n"version": "1"\n=======\n"version": "2"\n>>>>>>> b\n' >"$T/readme.txt"; check "vc: not a manifest name -> 1" 1 "$(bash "$root/version-conflict.sh" "$T/readme.txt" >/dev/null 2>&1; echo $?)"
+
+# ---------------------------------------------------------------- sync.sh (gh is a stub)
+mkdir -p "$T/stub"
+cat >"$T/stub/gh" <<'STUB'
+#!/usr/bin/env bash
+d=$STUB_DIR
+echo "$*" >>"$d/calls.log"
+title=""; head=""
+case "$1 $2" in
+  "pr list") cat "$d/prs.json" ;;
+  "pr view") echo "https://example.invalid/pr/1" ;;
+  "pr create" | "pr edit")
+    while [ $# -gt 0 ]; do
+      case $1 in --title) title=$2; shift ;; --body-file) cp "$2" "$d/body.md"; shift ;; --head) head=$2; shift ;; esac
+      shift
+    done
+    echo "$title" >"$d/title.txt"
+    [ -z "$head" ] || printf '[{"number":1,"headRefName":"%s"}]' "$head" >"$d/prs.json"
+    echo "https://example.invalid/pr/1" ;;
+  *) echo "stub gh: unexpected: $*" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$T/stub/gh"
+export STUB_DIR="$T/stubdata"
+
 sy_fresh() {
-  rm -rf "$T/up" "$T/origin.git" "$T/fork"
+  rm -rf "$T/up" "$T/origin.git" "$T/fork" "$STUB_DIR"; mkdir -p "$STUB_DIR"; echo '[]' >"$STUB_DIR/prs.json"; : >"$STUB_DIR/calls.log"
   git init -q -b main "$T/up"; cd "$T/up" || exit 1
-  mkdir -p plug/hooks
+  mkdir -p plug/hooks plug/.claude-plugin
   echo 'export const a = 1' >plug/hooks/a.ts
   echo 'readme' >README.md
-  mkdir -p plug/.claude-plugin
   printf '{\n  "name": "p",\n  "version": "1.0.0",\n  "description": "d"\n}\n' >plug/.claude-plugin/plugin.json
-  printf '{\n  "name": "m",\n  "plugins": [\n    {\n      "name": "p",\n      "source": "./plug",\n      "version": "1.0.0"\n    },\n    {\n      "name": "other",\n      "source": "./other",\n      "version": "1.0.0"\n    }\n  ]\n}\n' >plug-market.json
-  mkdir -p .claude-plugin; mv plug-market.json .claude-plugin/marketplace.json
   git add -A; git commit -qm init
   git clone -q --bare "$T/up" "$T/origin.git"
   git clone -q "$T/origin.git" "$T/fork"
   cd "$T/fork" || exit 1
   mkdir -p tools; echo '// fork-patch: keep callit()' >>plug/hooks/a.ts
-  sed -i 's/"version": "1.0.0"/"version": "1.0.0-fork.1"/' plug/.claude-plugin/plugin.json .claude-plugin/marketplace.json
-  # the marketplace entry of the other plugin must keep its own version
-  sed -i '0,/"version": "1.0.0-fork.1"/! s/"version": "1.0.0-fork.1"/"version": "1.0.0"/' .claude-plugin/marketplace.json
+  sed -i 's/"version": "1.0.0"/"version": "1.0.0-fork.1"/' plug/.claude-plugin/plugin.json
+  printf 'plug/hooks/**\n**/hooks.json\n' >tools/hook-text-paths.txt
   cat >tools/fork-guard.sh <<'G'
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
 grep -q 'fork-patch: keep' plug/hooks/a.ts || { echo "fork-guard: marker missing" >&2; exit 1; }
 [ "$(grep -rho 'callit(' plug | wc -l)" -eq 1 ] || { echo "fork-guard: callit( must occur exactly once" >&2; exit 1; }
-echo ok
+echo "fork-guard: ok"
 G
   git add -A; git commit -qm "fork patch"; git push -q origin HEAD:main
 }
 sy_up() { cd "$T/up" || exit 1; "$@"; git add -A; git commit -qm "upstream change"; }
-sy_run() { # prints decision
+sy_run() { # prints the decision; the main of the origin is recorded before and after
   cd "$T/fork" || exit 1
-  git checkout -q main; git fetch -q origin; git reset -q --hard origin/main
-  UPSTREAM_URL="$T/up" PLUGIN_PATHS=plug DRY_RUN=1 bash "$root/sync.sh" >"$T/sync.out" 2>&1
+  git checkout -q main; git fetch -q origin; git reset -q --hard origin/main; git clean -qfd
+  MAIN_BEFORE=$(git -C "$T/origin.git" rev-parse main)
+  PATH="$T/stub:$PATH" UPSTREAM_URL="$T/up" PLUGIN_PATHS=plug REPO=x/y "${SYNC_ENV[@]}" bash "$root/sync.sh" >"$T/sync.out" 2>&1
   rc=$?
+  MAIN_AFTER=$(git -C "$T/origin.git" rev-parse main)
+  printf '%s\n%s\n' "$MAIN_BEFORE" "$MAIN_AFTER" >"$T/main.rec"   # the caller runs us in $(...)
   [ $rc -eq 0 ] || { echo "rc$rc"; return; }
   sed -n 's/^DECISION=//p' "$T/sync.out"
 }
+SYNC_ENV=(env)
+main_same() { check "$1: main of the origin unchanged" "$(sed -n 1p "$T/main.rec")" "$(sed -n 2p "$T/main.rec")"; }
+body_has() { grep -q -F -- "$1" "$STUB_DIR/body.md" && echo yes || echo no; }
+branches() { git -C "$T/origin.git" for-each-ref --format='%(refname:short)' 'refs/heads/upstream-sync/*'; }
+title() { cat "$STUB_DIR/title.txt"; }
 
-sy_ver() { git -C "$T/fork" show "$1:plug/.claude-plugin/plugin.json" | jq -r .version; }
-sy_mver() { git -C "$T/fork" show "$1:.claude-plugin/marketplace.json" | jq -r --arg n "$2" '.plugins[] | select(.name == $n) | .version'; }
-sy_branch() { git -C "$T/fork" for-each-ref --format='%(refname:short)' 'refs/heads/sync/*' | head -n1; }
+sy_fresh; check "sync: nothing new -> nothing" nothing "$(sy_run)"; main_same "sync: nothing new"
+check "sync: ... no branch, no pr call" 00 "$(branches | wc -l)$(grep -c 'pr create' "$STUB_DIR/calls.log")"
 
-sy_fresh; check "sync: fixture starts with a fork version" 1.0.0-fork.1 "$(git -C "$T/fork" show HEAD:plug/.claude-plugin/plugin.json | jq -r .version)"
-check "sync: fixture marketplace: plugin entry" 1.0.0-fork.1 "$(git -C "$T/fork" show HEAD:.claude-plugin/marketplace.json | jq -r '.plugins[0].version')"
-check "sync: fixture marketplace: other entry" 1.0.0 "$(git -C "$T/fork" show HEAD:.claude-plugin/marketplace.json | jq -r '.plugins[1].version')"
-sy_fresh; check "sync: nothing new" nothing "$(sy_run)"
-sy_fresh; sy_up sh -c 'echo more >>README.md'; check "sync: harmless README commit -> push" push "$(sy_run)"
-sy_fresh; sy_up sh -c 'echo "fetch(\"https://example.com\")" >>plug/hooks/b.ts'; check "sync: new fetch( -> pr" pr "$(sy_run)"
-sy_fresh; sy_up sh -c 'sed -i "/fork-patch/d" plug/hooks/a.ts; echo x >>plug/hooks/a.ts'; check "sync: marker removed -> pr (conflict or guard)" pr "$(sy_run)"
-# a clean merge that still breaks the fork patch: only the guard can see it
-sy_fresh
-sy_up sh -c 'mkdir -p plug/lib; echo "callit()" >plug/lib/c.ts'
-check "sync: clean merge that breaks the patch -> pr" pr "$(sy_run)"
-grep -q 'fork-guard.sh failed' "$T/sync.out" && r=guard || r=other
-check "sync: ... and it is the guard that says so" guard "$r"
-grep -q 'Capability diff' "$T/sync.out" && r=fired || r=quiet
-check "sync: ... while capability-diff stays quiet" quiet "$r"
-sy_fresh
-sy_up sh -c 'mkdir -p plug/lib; echo "// callit" >plug/lib/c.ts'
-check "sync: same shape, patch intact -> push (guard negative control)" push "$(sy_run)"
-sy_fresh; sy_up sh -c 'echo "{\"hooks\":{}}" >plug/hooks/hooks.json'; check "sync: new hooks.json -> pr" pr "$(sy_run)"
-sy_fresh; sy_up sh -c 'echo "line" >>plug/hooks/a.ts'; check "sync: conflicting change to the patched file -> pr" pr "$(sy_run)"
-grep -q 'Merge conflict' "$T/sync.out" && r=ok || r=no; check "sync: ... reported as conflict" ok "$r"
-sy_fresh; sy_up sh -c 'echo "fetch(\"https://x\")" >>other.ts'; check "sync: fetch( outside plugin_paths -> push (documented limit)" push "$(sy_run)"
-sy_fresh; sy_up sh -c 'mkdir -p .github/workflows; echo "on: push" >.github/workflows/up.yml'; check "sync: upstream workflow -> pr" pr "$(sy_run)"
-git -C "$T/fork" ls-tree -r --name-only HEAD | grep -q '^.github/workflows/up.yml$' && r=leaked || r=withheld
-check "sync: upstream workflow file is withheld from the branch" withheld "$r"
-# ---------------------------------------------------------------- versions
-ov() { git -C "$T/origin.git" show main:plug/.claude-plugin/plugin.json | jq -r .version; }
-omv() { git -C "$T/origin.git" show main:.claude-plugin/marketplace.json | jq -r --arg n "$1" '.plugins[] | select(.name == $n) | .version'; }
-sy_real() { # like sy_run, but pushes into the local origin
-  cd "$T/fork" || exit 1
-  git checkout -q main; git fetch -q origin; git reset -q --hard origin/main
-  UPSTREAM_URL="$T/up" PLUGIN_PATHS=plug REPO=x/y bash "$root/sync.sh" >"$T/sync.out" 2>&1
-  rc=$?
-  [ $rc -eq 0 ] || { echo "rc$rc"; return; }
-  sed -n 's/^DECISION=//p' "$T/sync.out"
-}
-sy_unpatch() { # the fork without a guard: plain upstream versions
-  cd "$T/fork" || exit 1
-  git rm -q tools/fork-guard.sh
-  sed -i 's/-fork\.1//' plug/.claude-plugin/plugin.json .claude-plugin/marketplace.json
-  git add -A; git commit -qm unpatch; git push -q origin HEAD:main
-}
-UP_BUMP='sed -i "s/\"version\": \"1.0.0\"/\"version\": \"1.1.0\"/" plug/.claude-plugin/plugin.json; sed -i "0,/\"version\": \"1.0.0\"/s//\"version\": \"1.1.0\"/" .claude-plugin/marketplace.json'
-
-# (1) version-only conflict: fork carries -fork.1, upstream bumps the same lines (plugin.json AND marketplace.json)
-sy_fresh; sy_up sh -c "$UP_BUMP; mkdir -p plug/lib; echo 'export const z = 1' >plug/lib/z.ts"
-check "ver: version-only conflict is resolved and pushed" push "$(sy_real)"
-check "ver: ... plugin.json gets upstream version + fork suffix" 1.1.0-fork.1 "$(ov)"
-check "ver: ... marketplace entry of the plugin follows" 1.1.0-fork.1 "$(omv p)"
-check "ver: ... marketplace entry of another plugin is untouched" 1.0.0 "$(omv other)"
-check "ver: ... run said it resolved by itself" yes "$(grep -q 'Version-only conflict resolved automatically' "$T/sync.out" && echo yes || echo no)"
-check "ver: ... no conflict markers on main" 0 "$(git -C "$T/origin.git" grep -c -E '^(<<<<<<<|>>>>>>>)' main -- plug .claude-plugin | wc -l)"
-# negative control: the same bump WITHOUT a fork change on those lines merges cleanly, still one version
-check "ver: ... second run is quiet" nothing "$(sy_real)"
-
-# (2) content changed, upstream did not bump: own suffix bump
-sy_fresh; sy_up sh -c "mkdir -p plug/lib; echo 'export const z = 1' >plug/lib/z.ts"
-check "ver: content change without upstream bump -> push" push "$(sy_real)"
-check "ver: ... fork.1 becomes fork.2" 1.0.0-fork.2 "$(ov)"
-check "ver: ... marketplace entry follows" 1.0.0-fork.2 "$(omv p)"
-check "ver: ... other marketplace entry untouched" 1.0.0 "$(omv other)"
-# negative control: change outside the plugin path leaves the version alone
+# a harmless commit becomes a PR, not a merge
 sy_fresh; sy_up sh -c 'echo more >>README.md'
-check "ver: change outside the plugin -> push" push "$(sy_real)"
-check "ver: ... version unchanged" 1.0.0-fork.1 "$(ov)"
-# fork suffix counts on: fork.3 -> fork.4
-sy_fresh; cd "$T/fork" && { sed -i 's/-fork\.1/-fork.3/' plug/.claude-plugin/plugin.json; git add -A; git commit -qm f3; git push -q origin HEAD:main; }
-sy_up sh -c "mkdir -p plug/lib; echo 'export const z = 1' >plug/lib/z.ts"
-check "ver: fork.3 + content change" push "$(sy_real)"
-check "ver: ... becomes fork.4" 1.0.0-fork.4 "$(ov)"
-# upstream bumps only the manifest: new base version, suffix restarts, no double bump
-sy_fresh; sy_up sh -c 'sed -i "s/\"version\": \"1.0.0\"/\"version\": \"1.0.1\"/" plug/.claude-plugin/plugin.json'
-check "ver: manifest-only upstream bump -> push" push "$(sy_real)"
-check "ver: ... 1.0.1-fork.1 (no double bump)" 1.0.1-fork.1 "$(ov)"
-# unpatched fork (no guard): upstream version taken as is, suffix only without upstream bump
-sy_fresh; sy_unpatch; sy_up sh -c "$UP_BUMP; mkdir -p plug/lib; echo 'export const z = 1' >plug/lib/z.ts"
-check "ver: unpatched fork, upstream bump -> push" push "$(sy_real)"
-check "ver: ... plain upstream version" 1.1.0 "$(ov)"
-sy_fresh; sy_unpatch; sy_up sh -c "mkdir -p plug/lib; echo 'export const z = 1' >plug/lib/z.ts"
-check "ver: unpatched fork, content without bump -> push" push "$(sy_real)"
-check "ver: ... gets its own suffix" 1.0.0-fork.1 "$(ov)"
+check "sync: harmless README commit -> pr-created (no auto-merge)" pr-created "$(sy_run)"; main_same "sync: harmless commit"
+check "sync: ... one upstream-sync branch exists" 1 "$(branches | wc -l)"
+check "sync: ... the branch contains the upstream commit" yes "$(git -C "$T/origin.git" merge-base --is-ancestor "$(git -C "$T/up" rev-parse HEAD)" "$(branches | head -n1)" && echo yes || echo no)"
+check "sync: ... the branch is named upstream-sync/<date>" "upstream-sync/$(date -u +%F)" "$(branches)"
+check "sync: ... pr targets main" yes "$(grep -q -- '--base main' "$STUB_DIR/calls.log" && echo yes || echo no)"
+check "sync: ... title is plain" "sync: upstream $(git -C "$T/up" rev-parse --short=12 HEAD)" "$(title)"
+check "sync: ... body: no hits" yes "$(body_has '| Guardrail hits | 0 |')"
+check "sync: ... body lists the upstream commit" yes "$(body_has 'upstream change')"
+check "sync: ... body lists the changed file" yes "$(body_has 'README.md')"
+check "sync: ... body: fork-guard passed" yes "$(body_has 'fork-guard on the merged tree | passed')"
 
-# (3) conflict outside the version line: a person decides
+# guardrail hits show up in the text
+sy_fresh; sy_up sh -c 'mkdir -p plug/lib; echo "fetch(\"https://example.com\")" >plug/lib/n.ts'
+check "sync: new fetch( -> pr-created" pr-created "$(sy_run)"; main_same "sync: fetch("
+check "sync: ... body shows the pattern hit" yes "$(body_has 'plug/lib/n.ts')"
+check "sync: ... hit counted" yes "$(body_has '| Guardrail hits | 1 |')"
+check "sync: ... not a hook text change" no "$(grep -q 'hook texts changed' "$STUB_DIR/title.txt" && echo yes || echo no)"
+
+# the hook-text rule: a change to a listed file is flagged, a change to an unlisted file is not
+sy_fresh; sy_up sh -c 'sed -i "1s/.*/export const a = 2/" plug/hooks/a.ts'
+check "sync: listed hook file changed -> pr-created" pr-created "$(sy_run)"; main_same "sync: hook text"
+check "sync: ... title says so" "sync: upstream $(git -C "$T/up" rev-parse --short=12 HEAD) [hook texts changed]" "$(title)"
+check "sync: ... body names the file" yes "$(body_has 'Hook text changed: `plug/hooks/a.ts`')"
+check "sync: ... summary row" yes "$(body_has '| Hook texts changed | YES |')"
+sy_fresh; sy_up sh -c 'mkdir -p plug/lib; echo "export const c = 1" >plug/lib/c.ts'
+check "sync: unlisted file changed -> pr-created" pr-created "$(sy_run)"; main_same "sync: unlisted file"
+check "sync: ... no hook text marker" no "$(grep -q 'hook texts changed' "$STUB_DIR/title.txt" && echo yes || echo no)"
+check "sync: ... summary row says no" yes "$(body_has '| Hook texts changed | no |')"
+
+# fork-guard result on the merged tree
+sy_fresh; sy_up sh -c 'mkdir -p plug/lib; echo "callit()" >plug/lib/c.ts'
+check "sync: clean merge that breaks the patch -> pr-created" pr-created "$(sy_run)"; main_same "sync: guard"
+check "sync: ... title flags fork-guard" "sync: upstream $(git -C "$T/up" rev-parse --short=12 HEAD) [fork-guard failed]" "$(title)"
+check "sync: ... body has the guard message" yes "$(body_has 'callit( must occur exactly once')"
+
+# conflicts, with version conflicts labelled
+sy_fresh; sy_up sh -c 'sed -i "s/\"version\": \"1.0.0\"/\"version\": \"1.1.0\"/" plug/.claude-plugin/plugin.json'
+check "sync: version-only manifest conflict -> pr-created" pr-created "$(sy_run)"; main_same "sync: version conflict"
+check "sync: ... labelled as version lines only" yes "$(body_has 'plugin.json` (version lines only)')"
 sy_fresh; sy_up sh -c 'sed -i "s/\"version\": \"1.0.0\"/\"version\": \"1.1.0\"/; s/\"description\": \"d\"/\"description\": \"d2\"/" plug/.claude-plugin/plugin.json'
-check "ver: conflict hunk with a non-version line -> pr" pr "$(sy_run)"
-check "ver: ... reported as conflict in plugin.json" yes "$(grep -q 'Merge conflict' "$T/sync.out" && grep -q 'plugin.json' "$T/sync.out" && echo yes || echo no)"
-check "ver: ... and not claimed as resolved" no "$(grep -q 'resolved automatically' "$T/sync.out" && echo yes || echo no)"
-sy_fresh; sy_up sh -c "$UP_BUMP; echo 'line' >>plug/hooks/a.ts"
-check "ver: version-only manifest conflict + real conflict elsewhere -> pr" pr "$(sy_run)"
-check "ver: ... the code conflict is listed" yes "$(grep -q 'plug/hooks/a.ts' "$T/sync.out" && echo yes || echo no)"
-check "ver: ... the version-only conflict is resolved on the branch" yes "$(grep -q 'resolved automatically' "$T/sync.out" && echo yes || echo no)"
-check "ver: ... branch version set by the rule" 1.1.0-fork.1 "$(sy_ver "$(sy_branch)")"
+check "sync: manifest conflict beyond the version line -> pr-created" pr-created "$(sy_run)"
+check "sync: ... labelled as not only version lines" yes "$(body_has 'not only version lines')"
+sy_fresh; sy_up sh -c 'echo line >>plug/hooks/a.ts'
+check "sync: conflict in code -> pr-created" pr-created "$(sy_run)"; main_same "sync: code conflict"
+check "sync: ... listed as merge conflict" yes "$(body_has 'Merge conflict')"
 
-# the resolver on its own
-rv() { printf '%s' "$1" >"$T/plugin.json"; cp "$T/plugin.json" "$T/m.orig"; bash "$root/resolve-version-conflicts.sh" "$T/plugin.json"; echo $?; }
-VONLY=$'{\n<<<<<<< HEAD\n  "version": "1.0.0-fork.1",\n=======\n  "version": "1.1.0",\n>>>>>>> up\n  "name": "p"\n}\n'
-MIXED=$'{\n<<<<<<< HEAD\n  "version": "1.0.0-fork.1",\n  "description": "d"\n=======\n  "version": "1.1.0",\n  "description": "d2"\n>>>>>>> up\n  "name": "p"\n}\n'
-TWO=$'{\n<<<<<<< HEAD\n  "version": "1",\n=======\n  "version": "2",\n>>>>>>> up\n  "x": 1,\n<<<<<<< HEAD\n  "a": 1\n=======\n  "a": 2\n>>>>>>> up\n}\n'
-mv_file="$T/plugin.json"
-cd "$T" || exit 1
-check "resolver: version-only hunk -> 0" 0 "$(rv "$VONLY")"
-check "resolver: ... takes the upstream line" '"version": "1.1.0",' "$(grep version "$mv_file" | sed 's/^ *//')"
-check "resolver: ... leaves valid JSON" 0 "$(sed 's/"version": "1.1.0",/"version": "1.1.0"/' "$mv_file" >/dev/null; jq -e . "$mv_file" >/dev/null 2>&1 && echo 0 || echo 1)"
-check "resolver: hunk with another line -> 1" 1 "$(rv "$MIXED")"
-check "resolver: ... file left untouched" yes "$(cmp -s "$T/plugin.json" "$T/m.orig" && echo yes || echo no)"
-check "resolver: one version hunk + one other hunk -> 1" 1 "$(rv "$TWO")"
-check "resolver: file untouched too" yes "$(cmp -s "$T/plugin.json" "$T/m.orig" && echo yes || echo no)"
-printf 'no markers\n' >"$T/plugin.json"; check "resolver: no markers -> 1" 1 "$(bash "$root/resolve-version-conflicts.sh" "$T/plugin.json" >/dev/null 2>&1; echo $?)"
-printf '<<<<<<< a\n"version": "1"\n=======\n"version": "2"\n>>>>>>> b\n' >"$T/readme.txt"; check "resolver: not a manifest name -> 1" 1 "$(bash "$root/resolve-version-conflicts.sh" "$T/readme.txt" >/dev/null 2>&1; echo $?)"
+# workflow files are withheld
+sy_fresh; sy_up sh -c 'mkdir -p .github/workflows; echo "on: push" >.github/workflows/up.yml'
+check "sync: upstream workflow -> pr-created" pr-created "$(sy_run)"; main_same "sync: workflow"
+check "sync: ... body names it" yes "$(body_has '.github/workflows/up.yml')"
+check "sync: ... the file is not on the pushed branch" no "$(git -C "$T/origin.git" ls-tree -r --name-only "$(branches | head -n1)" | grep -q '^.github/workflows/up.yml$' && echo yes || echo no)"
 
-# real (non-dry) push into a local origin: main advances by fast-forward, no sync branch is left
+# the open pull request is updated, not duplicated
+sy_fresh; sy_up sh -c 'echo one >>README.md'
+check "pr: first run creates" pr-created "$(sy_run)"; b1=$(branches); sha1=$(git -C "$T/origin.git" rev-parse "$b1")
+check "pr: same state again -> pr-unchanged" pr-unchanged "$(sy_run)"; main_same "pr: unchanged"
+check "pr: ... branch not rewritten" "$sha1" "$(git -C "$T/origin.git" rev-parse "$b1")"
+sy_up sh -c 'echo two >>README.md'
+check "pr: newer upstream -> pr-updated" pr-updated "$(sy_run)"; main_same "pr: updated"
+check "pr: ... still one branch, same name" "$b1" "$(branches)"
+check "pr: ... branch moved" yes "$([ "$sha1" != "$(git -C "$T/origin.git" rev-parse "$b1")" ] && echo yes || echo no)"
+check "pr: ... branch has the newer upstream commit" yes "$(git -C "$T/origin.git" merge-base --is-ancestor "$(git -C "$T/up" rev-parse HEAD)" "$b1" && echo yes || echo no)"
+check "pr: ... body was edited, no second create" 1 "$(grep -c 'pr create' "$STUB_DIR/calls.log")"
+check "pr: ... edit call happened" 1 "$(grep -c 'pr edit' "$STUB_DIR/calls.log")"
+# a person pushed to the sync branch: the sync leaves it alone
+cd "$T" && rm -rf human && git clone -q "$T/origin.git" human && cd human && git checkout -q "$b1" \
+  && GIT_AUTHOR_EMAIL=h@example.invalid GIT_COMMITTER_EMAIL=h@example.invalid git commit -q --allow-empty -m "human fix" && git push -q origin "HEAD:refs/heads/$b1"
+humansha=$(git -C "$T/origin.git" rev-parse "$b1")
+sy_up sh -c 'echo three >>README.md'
+check "pr: person's commit on the branch -> pr-human-edits" pr-human-edits "$(sy_run)"; main_same "pr: human edits"
+check "pr: ... branch untouched" "$humansha" "$(git -C "$T/origin.git" rev-parse "$b1")"
+
+# upstream default branch is resolved when none is given; other base branch is honoured
+sy_fresh; cd "$T/up" && git branch -q -m trunk && echo more >>README.md && git add -A && git commit -qm c
+check "sync: upstream default branch 'trunk' is found" pr-created "$(sy_run)"
 sy_fresh; sy_up sh -c 'echo more >>README.md'
-cd "$T/fork" && git checkout -q main && before=$(git rev-parse origin/main)
-UPSTREAM_URL="$T/up" PLUGIN_PATHS=plug REPO=x/y bash "$root/sync.sh" >"$T/sync.out" 2>&1
-after=$(git -C "$T/origin.git" rev-parse main)
-check "sync: real push moved origin main" yes "$([ "$before" != "$after" ] && echo yes || echo no)"
-check "sync: origin main contains the upstream commit" yes "$(git -C "$T/origin.git" merge-base --is-ancestor "$(git -C "$T/up" rev-parse HEAD)" main && echo yes || echo no)"
-check "sync: origin main is a descendant of the old main (fast-forward)" yes "$(git -C "$T/origin.git" merge-base --is-ancestor "$before" main && echo yes || echo no)"
-check "sync: no sync branch left on origin" 0 "$(git -C "$T/origin.git" branch --list 'sync/*' | wc -l)"
-check "sync: second run is nothing" nothing "$(sy_run)"
+cd "$T/fork" && git checkout -q -b sync-test/base && git push -q origin HEAD:refs/heads/sync-test/base && git checkout -q main
+SYNC_ENV=(env BASE=sync-test/base)
+cd "$T/fork" && git checkout -q sync-test/base
+MAIN_BEFORE=$(git -C "$T/origin.git" rev-parse main)
+PATH="$T/stub:$PATH" UPSTREAM_URL="$T/up" PLUGIN_PATHS=plug REPO=x/y BASE=sync-test/base bash "$root/sync.sh" >"$T/sync.out" 2>&1
+MAIN_AFTER=$(git -C "$T/origin.git" rev-parse main)
+printf '%s\n%s\n' "$MAIN_BEFORE" "$MAIN_AFTER" >"$T/main.rec"
+check "sync: BASE=<test branch> targets that branch" yes "$(grep -q -- '--base sync-test/base' "$STUB_DIR/calls.log" && echo yes || echo no)"; main_same "sync: test base"
+SYNC_ENV=(env)
+
+# dry run writes nothing
+sy_fresh; sy_up sh -c 'echo more >>README.md'
+SYNC_ENV=(env DRY_RUN=1); check "sync: DRY_RUN -> pr-created decision" pr-created "$(sy_run)"; SYNC_ENV=(env)
+check "sync: ... but no branch on the origin" 0 "$(branches | wc -l)"
+
+# structure: the single push in sync.sh is the guarded one, and it refuses other refs
+check "sync: exactly one git push in sync.sh" 1 "$(grep -c 'git push' "$root/sync.sh")"
+pf=$(sed -n '/^push_sync_branch()/,/^}/p' "$root/sync.sh")
+check "sync: push_sync_branch refuses main" 9 "$(bash -c "die() { echo \"\$*\" >&2; exit 9; }; $pf; push_sync_branch main ''" >/dev/null 2>&1; echo $?)"
+check "sync: push_sync_branch lets the sync namespace through to git" yes "$(bash -c "die() { exit 9; }; git() { echo PUSH; }; $pf; push_sync_branch upstream-sync/x ''" 2>&1 | grep -q PUSH && echo yes || echo no)"
 
 echo "---- $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

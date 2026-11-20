@@ -1,8 +1,8 @@
 name: upstream-sync
 
-# Reusable workflow: pulls an upstream branch into the calling fork behind guardrails.
-# Clean merge -> fast-forward push to the branch. Anything suspicious -> pull request.
-# See README.md for the guardrails and their limits.
+# Reusable workflow: proposes the upstream default branch to the calling fork as a pull request.
+# It never merges and never pushes to the base branch; the only ref it writes is
+# upstream-sync/<date> (sync.sh refuses any other). See README.md for the checks and their limits.
 on:
   workflow_call:
     inputs:
@@ -11,13 +11,21 @@ on:
         type: string
         required: true
       branch:
-        description: branch name, the same on upstream and fork
+        description: upstream branch (empty = the upstream's default branch)
+        type: string
+        default: ''
+      base:
+        description: fork branch the pull request targets
         type: string
         default: main
       plugin_paths:
         description: newline-separated paths scanned for capability changes
         type: string
         default: .
+      hook_paths_file:
+        description: file in the fork listing the hook-text paths (one glob per line)
+        type: string
+        default: tools/hook-text-paths.txt
 
 permissions: {}
 
@@ -30,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write
+      contents: write        # pushes upstream-sync/* only; main is never written
       pull-requests: write
     steps:
       # The scripts come from the same commit of this repository that the caller pinned.
@@ -45,18 +53,17 @@ jobs:
       - name: Check out the fork
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.branch }}
+          ref: ${{ inputs.base }}
           path: repo
           fetch-depth: 0
 
-      - name: Sync
+      - name: Propose upstream
         working-directory: repo
         env:
           UPSTREAM: ${{ inputs.upstream }}
           BRANCH: ${{ inputs.branch }}
+          BASE: ${{ inputs.base }}
           PLUGIN_PATHS: ${{ inputs.plugin_paths }}
+          HOOK_PATHS_FILE: ${{ inputs.hook_paths_file }}
           GH_TOKEN: ${{ github.token }}
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          bash ../tools/sync.sh
+        run: bash ../tools/sync.sh
